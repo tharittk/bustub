@@ -6,7 +6,7 @@
 
 BusTub is a relational database management system built at [Carnegie Mellon University](https://db.cs.cmu.edu) for the [Introduction to Database Systems](https://15445.courses.cs.cmu.edu) (15-445/645) course. This system was developed for educational purposes and should not be used in production environments.
 
-====================================== Writing in progress ======================================
+================================== Writing in progress ==================================
 # Building a SQL Database From Scratch 🛢️
 
 Building a relational database from the ground up was a monumental task, but it turned out also one of the most rewarding challenges for me as a software engineering apprentice. This project "sweated" my system programming. This post documents my journey of building BusTub, a disk-oriented SQL database management system in C++, as part of a project inspired by Carnegie Mellon University's renowned [15-445/645 Database Systems course](https://15445.courses.cs.cmu.edu/fall2024/).
