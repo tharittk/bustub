@@ -20,6 +20,9 @@ There are 4 parts in building BusTub:
 3.  **Query Execution Engine**: The brain that interprets SQL queries and executes them efficiently.
 4.  **Concurrency Control**: The traffic cop that allows multiple users to access and modify data simultaneously without chaos.
 
+![BusTub Project Organization](https://15445.courses.cs.cmu.edu/fall2024/project3/img/project-structure.svg)
+
+
 ## 💾 Part 1: The Buffer Pool Manager - The Gateway to Disk
 The first component I built was the Buffer Pool Manager (BPM), the database's gateway to the disk. Since disk I/O is orders of magnitude slower than memory access, the BPM acts as a critical caching layer. Its primary responsibility is to keep frequently used database pages in memory, minimizing slow disk reads and writes. This abstraction is powerful: it allows the database to handle datasets much larger than the available RAM, while the rest of the system can request data pages by their ID without needing to know if they are currently in memory or on disk.
 
@@ -266,4 +269,109 @@ Running main() from gmock_main.cc
 ```
 ---
 
-## Part 3: The Query Execution Engine
+## ⚙️ Part 3: The Query Execution Engine
+
+If Part 1 (Buffer Pool Manager) was the gateway to disk and Part 2 (B+ Tree) the highway for fast lookups, then **Part 3** is where queries actually *run*. This is the **Query Execution Engine**—the *Volcano*-style iterator layer that streams tuples from leaf operators up to the root of a query plan, one `Next()` at a time. Each executor implements a simple contract: `Next(Tuple*, RID*)` either returns a single result or signals “I’m done.” Deceptively elegant.
+
+---
+
+### Overview of the engine
+
+**Iterator (Volcano) model**: Every executor implements `Next()`; data flows upward, one tuple at a time. All these iterators form a tree that represents a **query plan**.
+
+
+The project spans: 
+1. access methods (scan/insert/update/delete/index scan)
+2. aggregation & joins, hash join + optimization 
+3. external merge sort + limit (memory does not fit all the data to be sorted) 
+
+Here I choose to only show `UpdateExecutor` to illustrate the challenge and insights, especially when deals with transaction semantics.
+
+
+### Update: In‑Place vs. Reinsert, with Correct Index Maintenance
+
+The `UpdateExecutor` is a **pipeline breaker**: I buffer all child tuples first (think “build phase”), compute their target expressions, and then apply updates with proper undo logging and **index maintenance**.
+
+I first compute the **new values** and decide whether the **primary key changed** (if any). Primary key changes imply “delete mark + reinsert”; otherwise I can **update in place** (while still producing undo logs). I also enforce a simple **write‑write conflict** rule using per‑tuple timestamps (my temp‐TS design): if you try to modify someone else’s temp or a higher TS, the transaction is tainted and aborted.
+
+```cpp
+auto UpdateExecutor::Next(Tuple *tuple, RID *rid) -> bool {
+  int count = 0;
+  if (produced_) return false;
+
+  auto txn = exec_ctx_->GetTransaction();
+  auto txn_mgr = exec_ctx_->GetTransactionManager();
+  auto temp_ts = txn->GetTransactionTempTs();
+
+  // Compute "inserted" values and detect key modifications
+  for (auto &base : tuple_buffer_) {
+    std::vector<Value> vals{};
+    for (auto &expr : plan_->target_expressions_) {
+      vals.push_back(expr->Evaluate(&base, child_executor_->GetOutputSchema()));
+    }
+    Tuple inserted{vals, &child_executor_->GetOutputSchema()};
+    bool pkey_mod = IsPrimaryKeyUpdated(base, inserted);
+    inserted_tuples_.push_back(inserted);
+    is_pkey_modified_.push_back(pkey_mod);
+  }
+
+  // Apply the updates with undo logging and conflict control
+  for (size_t i = 0; i < tuple_buffer_.size(); ++i) {
+    // Basic conflict check
+    if ((meta_buffer_[i].ts_ != temp_ts) &&
+        (IsTsTemp(meta_buffer_[i].ts_) ||
+         txn->GetReadTs() < meta_buffer_[i].ts_)) {
+          // ABORT transaction
+    }
+
+    // PKey changed → delete-mark + reinsert logic
+    if (is_pkey_modified_[i]) {
+      if (!table_->GetTupleMeta(rid_buffer_[i]).is_deleted_) {
+        // Append undo log 
+        table_->UpdateTupleMeta(TupleMeta{temp_ts, true}, rid_buffer_[i]);
+        auto prev = txn_mgr->GetUndoLink(rid_buffer_[i]);
+        auto link = prev.has_value() ? prev.value() : UndoLink{};
+        auto log = GenerateNewUndoLog(&table_info_->schema_, &tuple_buffer_[i],
+                                      nullptr, meta_buffer_[i].ts_, link);
+        auto new_link = txn->AppendUndoLog(log);
+        txn_mgr->UpdateUndoLink(rid_buffer_[i], new_link, nullptr);
+      }
+    } else {
+      // In-place update (self-mod vs normal)
+      auto prev_link = txn_mgr->GetUndoLink(rid_buffer_[i]);
+      if (meta_buffer_[i].ts_ == temp_ts) {
+        AtomicUpdateLogLinkTupleInplace(inserted_tuples_[i], prev_link, true, i);
+      } else {
+        AtomicUpdateLogLinkTupleInplace(inserted_tuples_[i], prev_link, false, i);
+      }
+    }
+
+    txn->AppendWriteSet(plan_->GetTableOid(), rid_buffer_[i]);
+    ++count;
+  }
+
+  UpdatePrimaryKeyIndex(); // keep indexes consistent
+  *tuple = Tuple{std::vector<Value>{Value{INTEGER, count}}, &GetOutputSchema()};
+  produced_ = true;
+  return true;
+}
+```
+
+### Some Flavors of Optimization
+
+- SeqScan → IndexScan (Filter Pushdown)
+
+When the predicate contains an equality on an indexed column, the optimizer transforms a `SeqScan`+`Filter` into an `IndexScan` with point lookup(s), or into an ordered `IndexScan` for `ORDER BY` on an index key.
+
+- NLJ → HashJoin (Equi‑Conditions)
+
+For joins with a conjunction of equi‑conditions, the optimizer replaces a nested‑loop join with a **HashJoin** that builds a hash table on the inner and probes with keys from the outer. The asymtotic behavior goes from O(n^2) to O(n).
+
+These optimizations are obvious but in reality, imagination is the only limit to how user's queries can be. It is very very hard to write general query optimization that works well on every scenario.
+
+### Design Takeaways
+- **Iterator discipline**: Even with fancy undo chains, never break the `Next()` contract.
+- **Indexes are part of updates**: Every modification must keep indexes in sync.
+- **Pipeline breakers**: Aggregation, hash join build, and my update buffering make plan phases explicit.
+
+
