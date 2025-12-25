@@ -6,7 +6,7 @@
 
 BusTub is a relational database management system built at [Carnegie Mellon University](https://db.cs.cmu.edu) for the [Introduction to Database Systems](https://15445.courses.cs.cmu.edu) (15-445/645) course. This system was developed for educational purposes and should not be used in production environments.
 
-============================ Writing in progress ============================
+=========================== Below is my blogging on BusTub ============================
 # Building a SQL Database From Scratch 🛢️
 
 Building a relational database from the ground up was a monumental task, but it turned out also one of the most rewarding challenges for me as a software engineering apprentice. This project "sweated" my system programming. This post documents my journey of building BusTub, a disk-oriented SQL database management system in C++, as part of a project inspired by Carnegie Mellon University's renowned [15-445/645 Database Systems course](https://15445.courses.cs.cmu.edu/fall2024/).
@@ -273,7 +273,6 @@ Running main() from gmock_main.cc
 
 If Part 1 (Buffer Pool Manager) was the gateway to disk and Part 2 (B+ Tree) the highway for fast lookups, then **Part 3** is where queries actually *run*. This is the **Query Execution Engine**—the *Volcano*-style iterator layer that streams tuples from leaf operators up to the root of a query plan, one `Next()` at a time. Each executor implements a simple contract: `Next(Tuple*, RID*)` either returns a single result or signals “I’m done.” Deceptively elegant.
 
----
 
 ### Overview of the engine
 
@@ -285,7 +284,7 @@ The project spans:
 2. aggregation & joins, hash join + optimization 
 3. external merge sort + limit (memory does not fit all the data to be sorted) 
 
-Here I choose to only show `UpdateExecutor` to illustrate the challenge and insights, especially when deals with transaction semantics.
+Here I choose to only show `UpdateExecutor` to illustrate the challenge and insights, especially when deals with transaction semantics (formally introduce in Project 4).
 
 
 ### Update: In‑Place vs. Reinsert, with Correct Index Maintenance
@@ -369,9 +368,179 @@ For joins with a conjunction of equi‑conditions, the optimizer replaces a nest
 
 These optimizations are obvious but in reality, imagination is the only limit to how user's queries can be. It is very very hard to write general query optimization that works well on every scenario.
 
-### Design Takeaways
+### SQL Engine Takeaways
 - **Iterator discipline**: Even with fancy undo chains, never break the `Next()` contract.
 - **Indexes are part of updates**: Every modification must keep indexes in sync.
 - **Pipeline breakers**: Aggregation, hash join build, and my update buffering make plan phases explicit.
 
+## ⏱️ Part 4: Multi‑Version Concurrency Control
+
+In Part 3, we started treating visibility and undo logs with care inside access‑method executors. In **Part 4**, we will implement **optimistic MVCC** for BusTub: timestamps, version chains, and watermarks, and then rework executors to be transaction‑aware end‑to‑end. The protocol is in the spirit of what HyPer/DuckDB use: base tuples live in the table heap; **undo logs** (deltas) live in each transaction’s workspace; a **version chain** ties them together so reads can reconstruct any past version.
+
+
+### MVCC Overview & What Changed
+
+- **Two timestamps per txn**: a **read timestamp** (assigned at `BEGIN`, equal to the last committed ts) and a **commit timestamp** (assigned at `COMMIT`, strictly increasing). Read ts defines what versions a transaction can *see*; commit ts defines serialization order.
+
+- **Storage split**: latest tuple in the **table heap**; a per‑RID pointer to its “front” **undo log** in the **transaction manager**; and the **undo logs** themselves stored inside each transaction. The “tuple + undo deltas” forms a singly‑linked **version chain**.
+
+The image below, taken from CMU project page, shows the version chain:
+
+![chain](https://15445.courses.cs.cmu.edu/fall2024/project4/img/1-1-ts.png)
+
+
+### Transaction Begin & Commit
+
+When a transaction starts, it records the **current last commit timestamp** as its `read_ts`. We also register it with the **watermark** tracker (lowest `read_ts` among running txns). On commit, we assign a new `commit_ts`, update base tuple metas for all RIDs in the write set, mark the txn `COMMITTED`, advance `last_commit_ts`, and then remove its `read_ts` from the watermark structure.
+
+```cpp
+auto TransactionManager::Begin(IsolationLevel isolation_level) -> Transaction * {
+  // ...House-keeping code...
+  txn_ref->read_ts_ = last_commit_ts_.load();
+  running_txns_.AddTxn(txn_ref->read_ts_);
+  return txn_ref;
+}
+
+auto TransactionManager::Commit(Transaction *txn) -> bool {
+  std::unique_lock<std::mutex> commit_lck(commit_mutex_); // single committer
+  // ...House-keeping code...
+
+  txn->commit_ts_ = last_commit_ts_.load() + 1;
+
+  for (const auto &[table_oid, rid_set] : txn->GetWriteSets()) {
+      // Update metadata of relavant entries
+  }
+
+  txn->state_ = TransactionState::COMMITTED;
+  running_txns_.UpdateCommitTs(txn->commit_ts_);
+  running_txns_.RemoveTxn(txn->read_ts_);
+  last_commit_ts_.fetch_add(1); // equal to txn->commit_ts_
+  return true;
+}
+```
+
+> **Why the mutex?** The spec requires only one transaction enters commit at a time; we use `commit_mutex_` to serialize timestamp assignment and write‑set finalization. 
+
+### Watermark in O(log N)
+
+The **watermark** is the minimum `read_ts` among active transactions (or the latest commit ts if none). We maintain it incrementally via `AddTxn` and `RemoveTxn` to avoid scanning all txns. The reference approach uses a hash‑map counter keyed by `read_ts` for amortized updates.
+
+Internally, the implementation leverages an ordered map (backed by a red-black tree) to support efficient O(log N) insertion and removal, ensuring that minimum retrieval remains fast even under high concurrency.
+
+```cpp
+auto Watermark::AddTxn(timestamp_t read_ts) -> void {
+  if (read_ts < commit_ts_) { 
+    throw Exception("read ts < commit ts"); 
+  }
+  // Insert to red-black tree
+}
+
+auto Watermark::RemoveTxn(timestamp_t read_ts) -> void {
+  // Decrease count associated with the rb-tree node. If count hits 0, remove from the tree
+}
+```
+
+## Version Chain: Storage Format & MVCC Tuple Retrieval
+
+- **Table heap** always stores the latest **base tuple** and its meta (`ts_`, `is_deleted_`).
+- The **transaction manager** stores, per RID, a pointer (`UndoLink`) to the **front** of the undo chain.
+- Each **transaction** stores its own `UndoLog` vector; each log has `ts_`, `modified_fields_` (per column bools), partial `tuple_`, and `prev_version_` (UndoLink).
+
+To update/read the per‑RID pointer atomically we used helper APIs:
+
+```cpp
+auto TransactionManager::UpdateUndoLink(RID rid, std::optional<UndoLink> prev_link,
+                                        std::function<bool(std::optional<UndoLink>)> &&check) -> bool {
+  // Atomic link update (compare-check-and-set)
+}
+
+auto GetTupleAndUndoLink(TransactionManager *txn_mgr, TableHeap *table_heap, RID rid)
+    -> std::tuple<TupleMeta, Tuple, std::optional<UndoLink>> {
+  // Atomic read of tuple + undo link
+}
+```
+
+### Temporary Timestamps (TXN temp ts)
+
+To identify **uncommitted** modifications in base tuples without changing the ts encoding, BusTub sets the **second most significant bit** of a 64‑bit timestamp (`1 << 62`) to **1** (so comparisons remain monotonic and non‑negative). A transaction’s **temporary ts** is `TXN_START_ID + human_readable_txn_id` with that bit set; committed tuples get normal `commit_ts`. Executors use this to decide whether the base tuple was modified by **me** (self‑mod) vs. **another uncommitted txn** vs. **a newer committed version**—and then collect undo logs accordingly. 
+
+### Collecting & Reconstructing Versions
+
+Retrieval logic breaks into two helpers (implemented in `execution_common.cpp`):
+
+- **CollectUndoLogs(meta, first_link, txn)**: 〔Project #4 spec〕
+  1) If base meta `ts_` ≤ `read_ts` or equal to **my** temp‑ts → no undo needed.
+  2) If base meta `ts_` is **newer** than my `read_ts` or is **another txn’s** temp‑ts → walk the chain, collect all logs **newer** than my `read_ts`.
+  3) If it’s **my own** temp‑ts → treat as case 1.
+
+- **ReconstructTuple(schema, base_tuple + meta, undo_logs)**: 〔Project #4 spec〕
+  Apply all deltas **without** checking ts fields; `modified_fields_` tells which positions to rewrite from each log’s partial `tuple_`. A deletion is represented by `is_delete` in either meta/log—yielding “deleted at this time” semantics. The base tuple is always complete; logs are **partial**.
+
+> This mirrors the delta‑table. Deltas live in transaction workspaces rather than on disk—and it’s the same mechanism we touched in Part 3’s index scan reconstruction.
+
+### MVCC Modification Executors + Commit
+
+### Insert
+
+Insert creates a new **table heap tuple** with **temp‑ts** and adds the RID to the txn **write set**. (Single‑threaded tests allow skipping atomic checks, but the CAS helpers are ready for concurrent tasks.)
+
+### Update / Delete
+
+Both generate an **UndoLog** and atomically link it into the chain, then update the base tuple/meta via `UpdateTupleAndUndoLink`. Write‑write conflicts are detected by inspecting the base meta timestamp: if another txn has a temp‑ts on the tuple, or the base meta ts is **newer** than my `read_ts`, we mark the txn **TAINTED** and throw `ExecutionException`. (Self‑mod is allowed.)
+```cpp
+auto UpdateTupleAndUndoLink(TransactionManager *txn_mgr, RID rid, 
+                            std::optional<UndoLink> undo_link,
+                            TableHeap *table_heap, Transaction *txn, 
+                            const TupleMeta &meta, const Tuple &tuple,
+                            std::function<bool(const TupleMeta&, const Tuple&, RID, std::optional<UndoLink>)> &&check) -> bool {
+
+  auto page_write_guard = table_heap->AcquireTablePageWriteLock(rid);
+  auto page = page_write_guard.AsMut<TablePage>();
+  auto [base_meta, base_tuple] = page->GetTuple(rid);
+  if (check && !check(base_meta, base_tuple, rid, undo_link)) { 
+    return false; 
+  }
+  if (meta != base_meta || !IsTupleContentEqual(tuple, base_tuple)) {
+    table_heap->UpdateTupleInPlaceWithLockAcquired(meta, tuple, rid, page);
+  }
+  txn_mgr->UpdateUndoLink(rid, undo_link);
+  return true;
+}
+```
+
+### 🧹 Stop‑the‑World Garbage Collection
+
+We remove transactions whose **undo logs are invisible** at the system watermark: i.e., no remaining transaction can ever observe those logs. Our `GarbageCollection()` finds all such txns and erases them from `txn_map_`. Dangling `UndoLink` pointers below the watermark may remain; scans won’t dereference them. (We also include `AreTxnLogsInvisible(...)` to decide whether a txn’s logs are fully overshadowed.)
+
+```cpp
+void TransactionManager::GarbageCollection() {
+  auto wm_ts = GetWatermark();
+  std::vector<txn_id_t> to_delete_txn_id;
+  for (auto &[txn_id, txn] : txn_map_) {
+    auto txn_state = txn->GetTransactionState();
+    /* skip running/tainted; only consider committed/aborted */
+    if (txn_state == TransactionState::COMMITTED || txn_state == TransactionState::ABORTED) {
+      if (txn->GetWriteSets().empty()) { 
+        to_delete_txn_id.push_back(txn_id); continue; 
+      }
+      if (AreTxnLogsInvisible(txn, wm_ts)) { 
+        to_delete_txn_id.push_back(txn_id); 
+    }
+  }
+  for (auto &txn_id : to_delete_txn_id) { 
+    txn_map_.erase(txn_id); 
+    }
+  }
+}
+```
+
+### MVCC Takeaways
+
+- **Temp‑ts tags** (2nd MSB) are a pragmatic way to mark uncommitted writes while retaining integer order semantics—keeps comparisons cheap and simple.
+- **Atomic tuple+link ops** (`UpdateTupleAndUndoLink` / `GetTupleAndUndoLink`) matter once concurrency starts: they prevent races between reading base tuple and changing the front undo link. 〔transaction_manager_impl.cpp〕
+- **Undo logs are partial**; reconstruction must be pure, deterministic, and only use the provided logs (do not rely on global state). That makes replays predictable under tests.
+- **Watermark‑aware GC** avoids traversing the entire txn map each time; it keeps memory use bounded without sacrificing correctness. 
+
+And that's it. This was how I spent my Summer in 2025 😁
+Highly this [CMU course](https://15445.courses.cs.cmu.edu/fall2024/) !
 
